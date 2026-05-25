@@ -1,7 +1,7 @@
 import {
-  extractApiKey, isValidApiKey,
   getProviderCredentials, markAccountUnavailable,
 } from "../services/auth.js";
+import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleTtsCore } from "open-sse/handlers/ttsCore.js";
@@ -32,13 +32,11 @@ export async function handleTts(request) {
   const language = body.language || ""; // Optional language hint (currently used by Gemini)
   log.request("POST", `${url.pathname} | ${modelStr} | format=${responseFormat}${language ? ` | lang=${language}` : ""}`);
 
+  const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
+  if (!policy.ok) return policy.response;
+  const keyContext = policy.keyContext;
+
   const settings = await getSettings();
-  if (settings.requireApiKey) {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-  }
 
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.input) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
@@ -46,6 +44,9 @@ export async function handleTts(request) {
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    const denied = assertModelAllowed(keyContext, comboModels, "AUTH");
+    if (denied) return denied;
+
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -60,6 +61,9 @@ export async function handleTts(request) {
       comboStickyLimit,
     });
   }
+
+  const denied = assertModelAllowed(keyContext, modelStr, "AUTH");
+  if (denied) return denied;
 
   return handleSingleModelTts(body, modelStr, responseFormat, language);
 }

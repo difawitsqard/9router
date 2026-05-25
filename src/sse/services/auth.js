@@ -300,9 +300,12 @@ export function extractApiKey(request) {
 }
 
 /**
- * Validate API key (optional - for local use can skip)
+ * Validate API key (boolean-compat). Prefer enforceApiKeyPolicy for new code
+ * — it returns rich context (tier, allowedModels, quota) and produces error
+ * responses for the request gate.
  */
 export async function isValidApiKey(apiKey) {
   if (!apiKey) return false;
-  return await validateApiKey(apiKey);
+  const result = await validateApiKey(apiKey);
+  return !!result?.valid;
 }

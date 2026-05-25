@@ -2,9 +2,8 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
-  extractApiKey,
-  isValidApiKey,
 } from "../services/auth.js";
+import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
 import { getSettings, getCombos } from "@/lib/localDb";
 import { AI_PROVIDERS, resolveProviderId } from "@/shared/constants/providers.js";
 import { handleFetchCore } from "open-sse/handlers/fetch/index.js";
@@ -38,27 +37,13 @@ export async function handleFetch(request) {
 
   log.request("POST", `${reqUrl.pathname} | ${providerInput}`);
 
-  // Log API key (masked)
-  const apiKey = extractApiKey(request);
-  if (apiKey) {
-    log.debug("AUTH", `API Key: ${log.maskKey(apiKey)}`);
-  } else {
-    log.debug("AUTH", "No API key provided (local mode)");
-  }
+  // Enforce API key policy (tier, expiry, quota). Provider allowlist enforced after combo resolution.
+  const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
+  if (!policy.ok) return policy.response;
+  const apiKey = policy.apiKey;
+  const keyContext = policy.keyContext;
 
-  // Enforce API key if enabled in settings
   const settings = await getSettings();
-  if (settings.requireApiKey) {
-    if (!apiKey) {
-      log.warn("AUTH", "Missing API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      log.warn("AUTH", "Invalid API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
 
   if (!providerInput || typeof providerInput !== "string") {
     log.warn("FETCH", "Missing provider/model");
@@ -82,6 +67,10 @@ export async function handleFetch(request) {
   const combos = await getCombos();
   const comboModels = getComboModelsFromData(providerInput, combos);
   if (comboModels) {
+    // Restricted keys: every sub-provider must be in the allowlist (strict combo policy).
+    const denied = assertModelAllowed(keyContext, comboModels, "AUTH");
+    if (denied) return denied;
+
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -96,6 +85,10 @@ export async function handleFetch(request) {
       comboStickyLimit
     });
   }
+
+  // Single-provider: enforce allowlist on the requested provider id.
+  const denied = assertModelAllowed(keyContext, providerInput, "AUTH");
+  if (denied) return denied;
 
   return handleSingleProviderFetch(body, providerInput, request, apiKey, settings);
 }

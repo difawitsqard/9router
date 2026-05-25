@@ -8,6 +8,12 @@ import {
 import { getProviderConnections, getCombos, getCustomModels, getModelAliases } from "@/lib/localDb";
 import { getDisabledModels } from "@/lib/disabledModelsDb";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
+import { resolveApiKeyContext } from "@/sse/services/apiKeyPolicy.js";
+import { KEY_TIER, isModelAllowedForKey } from "@/lib/localDb";
+
+// /v1/models reflects the caller's API key (allowlist filtering), so it cannot be
+// statically rendered. Force dynamic rendering on every request.
+export const dynamic = "force-dynamic";
 
 // Per-provider live model resolvers. Each receives a connection record and
 // returns { models: [{ id, name? }, ...] } | null on failure.
@@ -136,8 +142,10 @@ function comboMatchesKinds(combo, kindFilter) {
 /**
  * Build OpenAI-format models list filtered by service kinds.
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
+ * @param {object|null} [keyContext] - Resolved API key context. When provided and tier is RESTRICTED,
+ *   models are intersected with the key's allowlist. Pass null to skip key-based filtering.
  */
-export async function buildModelsList(kindFilter) {
+export async function buildModelsList(kindFilter, keyContext = null) {
   let connections = [];
   try {
     connections = await getProviderConnections();
@@ -396,6 +404,17 @@ export async function buildModelsList(kindFilter) {
     dedupedModels.push(model);
   }
 
+  // Per-key allowlist filtering. Skip for unlimited tier (god mode), missing
+  // key context (bypass / requireApiKey=false), or empty allowlist.
+  if (
+    keyContext &&
+    keyContext.tier === KEY_TIER.RESTRICTED &&
+    Array.isArray(keyContext.allowedModels) &&
+    keyContext.allowedModels.length > 0
+  ) {
+    return dedupedModels.filter((m) => isModelAllowedForKey(keyContext, m.id));
+  }
+
   return dedupedModels;
 }
 
@@ -416,9 +435,10 @@ export async function OPTIONS() {
  * GET /v1/models - OpenAI compatible models list (LLM/chat models only by default).
  * For other capabilities use /v1/models/{kind} (image, tts, stt, embedding, image-to-text, web).
  */
-export async function GET() {
+export async function GET(request) {
   try {
-    const data = await buildModelsList([LLM_KIND]);
+    const { keyContext } = await resolveApiKeyContext(request);
+    const data = await buildModelsList([LLM_KIND], keyContext);
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });

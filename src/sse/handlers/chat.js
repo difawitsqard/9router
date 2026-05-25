@@ -4,9 +4,8 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
-  extractApiKey,
-  isValidApiKey,
 } from "../services/auth.js";
+import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
@@ -55,29 +54,14 @@ export async function handleChat(request, clientRawRequest = null) {
   const effort = body.reasoning_effort || body.reasoning?.effort || null;
   log.request("POST", `${url.pathname} | ${modelStr} | ${msgCount} msgs${toolCount ? ` | ${toolCount} tools` : ""}${effort ? ` | effort=${effort}` : ""}`);
 
-  // Log API key (masked)
-  const authHeader = request.headers.get("Authorization");
-  const apiKey = extractApiKey(request);
-  if (authHeader && apiKey) {
-    const masked = log.maskKey(apiKey);
-    log.debug("AUTH", `API Key: ${masked}`);
-  } else {
-    log.debug("AUTH", "No API key provided (local mode)");
-  }
+  // Enforce API key policy (tier, expiry, quota). Model allowlist is checked
+  // after combo resolution so that combo names don't get rejected.
+  const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
+  if (!policy.ok) return policy.response;
+  const apiKey = policy.apiKey;
+  const keyContext = policy.keyContext;
 
-  // Enforce API key if enabled in settings
   const settings = await getSettings();
-  if (settings.requireApiKey) {
-    if (!apiKey) {
-      log.warn("AUTH", "Missing API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      log.warn("AUTH", "Invalid API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
 
   if (!modelStr) {
     log.warn("CHAT", "Missing model");
@@ -92,11 +76,15 @@ export async function handleChat(request, clientRawRequest = null) {
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    // Restricted keys: every sub-model must be in the allowlist (strict combo policy).
+    const denied = assertModelAllowed(keyContext, comboModels, "AUTH");
+    if (denied) return denied;
+
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
-    
+
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
     log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
     return handleComboChat({
@@ -110,7 +98,10 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  // Single model request
+  // Single model: enforce allowlist on the requested model id.
+  const denied = assertModelAllowed(keyContext, modelStr, "AUTH");
+  if (denied) return denied;
+
   return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
 }
 

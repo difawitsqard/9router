@@ -2,9 +2,8 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
-  extractApiKey,
-  isValidApiKey,
 } from "../services/auth.js";
+import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
 import { handleEmbeddingsCore } from "open-sse/handlers/embeddingsCore.js";
@@ -33,27 +32,10 @@ export async function handleEmbeddings(request) {
 
   log.request("POST", `${url.pathname} | ${modelStr}`);
 
-  // Log API key (masked)
-  const apiKey = extractApiKey(request);
-  if (apiKey) {
-    log.debug("AUTH", `API Key: ${log.maskKey(apiKey)}`);
-  } else {
-    log.debug("AUTH", "No API key provided (local mode)");
-  }
-
-  // Enforce API key if enabled in settings
-  const settings = await getSettings();
-  if (settings.requireApiKey) {
-    if (!apiKey) {
-      log.warn("AUTH", "Missing API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      log.warn("AUTH", "Invalid API key (requireApiKey=true)");
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
+  // Enforce API key policy (tier, expiry, quota). Model allowlist enforced below.
+  const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
+  if (!policy.ok) return policy.response;
+  const keyContext = policy.keyContext;
 
   if (!modelStr) {
     log.warn("EMBEDDINGS", "Missing model");
@@ -64,6 +46,9 @@ export async function handleEmbeddings(request) {
     log.warn("EMBEDDINGS", "Missing input");
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
   }
+
+  const denied = assertModelAllowed(keyContext, modelStr, "AUTH");
+  if (denied) return denied;
 
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) {

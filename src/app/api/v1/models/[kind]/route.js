@@ -1,4 +1,8 @@
 import { buildModelsList } from "../route.js";
+import { resolveApiKeyContext } from "@/sse/services/apiKeyPolicy.js";
+
+// Reflects per-API-key allowlist; cannot be statically rendered.
+export const dynamic = "force-dynamic";
 
 // URL slug → service kind(s). `web` covers both webSearch and webFetch.
 const KIND_SLUG_MAP = {
@@ -24,7 +28,7 @@ export async function OPTIONS() {
  * GET /v1/models/{kind} - OpenAI-compatible models list filtered by capability.
  * Supported kinds: image, tts, stt, embedding, image-to-text, web.
  */
-export async function GET(_request, { params }) {
+export async function GET(request, { params }) {
   try {
     const { kind } = await params;
     const kindFilter = KIND_SLUG_MAP[kind];
@@ -41,7 +45,8 @@ export async function GET(_request, { params }) {
       );
     }
 
-    const data = await buildModelsList(kindFilter);
+    const { keyContext } = await resolveApiKeyContext(request);
+    const data = await buildModelsList(kindFilter, keyContext);
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });

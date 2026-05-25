@@ -79,8 +79,19 @@ export const TABLES = {
       machineId: "TEXT",
       isActive: "INTEGER DEFAULT 1",
       createdAt: "TEXT NOT NULL",
+      // Policy fields (additive — null on legacy rows = treated as unlimited / god mode)
+      tier: "TEXT",                 // 'unlimited' | 'restricted'; null → unlimited (legacy)
+      expiresAt: "TEXT",            // ISO datetime; null → no expiry
+      tokenLimit: "INTEGER",        // total token quota; null → unlimited
+      tokenUsed: "INTEGER DEFAULT 0",
+      allowedModels: "TEXT",        // JSON array of model ids; null/empty → all allowed
+      updatedAt: "TEXT",
     },
-    indexes: ["CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)"],
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)",
+      "CREATE INDEX IF NOT EXISTS idx_ak_tier ON apiKeys(tier)",
+      "CREATE INDEX IF NOT EXISTS idx_ak_expires ON apiKeys(expiresAt)",
+    ],
   },
   combos: {
     columns: {

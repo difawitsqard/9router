@@ -277,6 +277,17 @@ export async function saveRequestUsage(entry) {
       const cur = db.get(`SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'`);
       const next = (cur ? parseInt(cur.value, 10) : 0) + 1;
       db.run(`INSERT INTO _meta(key, value) VALUES('totalRequestsLifetime', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(next)]);
+
+      // Per-key quota counter (audit + enforcement). Naik untuk semua tier;
+      // tier 'unlimited' di-bypass di pre-check, tier 'restricted' di-enforce
+      // saat validateApiKey berikutnya berjalan.
+      const totalTokens = (promptTokens || 0) + (completionTokens || 0);
+      if (entry.apiKey && totalTokens > 0) {
+        db.run(
+          `UPDATE apiKeys SET tokenUsed = COALESCE(tokenUsed, 0) + ?, updatedAt = ? WHERE key = ?`,
+          [totalTokens, new Date().toISOString(), entry.apiKey]
+        );
+      }
     });
 
     pushToRing(entry);

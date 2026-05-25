@@ -58,6 +58,11 @@ export default function APIPageClient({ machineId }) {
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyTier, setNewKeyTier] = useState("restricted");
+  const [newKeyExpiresAt, setNewKeyExpiresAt] = useState("");
+  const [newKeyTokenLimit, setNewKeyTokenLimit] = useState("");
+  const [newKeyAllowedModels, setNewKeyAllowedModels] = useState([]);
+  const [availableModels, setAvailableModels] = useState([]);
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
@@ -681,10 +686,21 @@ export default function APIPageClient({ machineId }) {
     if (!newKeyName.trim()) return;
 
     try {
+      const payload = {
+        name: newKeyName,
+        tier: newKeyTier,
+        expiresAt: newKeyExpiresAt
+          ? new Date(newKeyExpiresAt).toISOString()
+          : null,
+        tokenLimit: newKeyTokenLimit && Number(newKeyTokenLimit) > 0
+          ? Number(newKeyTokenLimit)
+          : null,
+        allowedModels: newKeyTier === "restricted" ? newKeyAllowedModels : [],
+      };
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newKeyName }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
 
@@ -692,12 +708,35 @@ export default function APIPageClient({ machineId }) {
         setCreatedKey(data.key);
         await fetchData();
         setNewKeyName("");
+        setNewKeyTier("restricted");
+        setNewKeyExpiresAt("");
+        setNewKeyTokenLimit("");
+        setNewKeyAllowedModels([]);
         setShowAddModal(false);
       }
     } catch (error) {
       console.log("Error creating key:", error);
     }
   };
+
+  // Lazy-load available models when create modal opens (filtered to LLM)
+  const fetchAvailableModels = useCallback(async () => {
+    try {
+      const res = await fetch("/v1/models", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const ids = (data?.data || []).map((m) => m.id).filter(Boolean);
+      setAvailableModels(ids.sort());
+    } catch (error) {
+      console.log("Error fetching models for allowlist:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showAddModal && availableModels.length === 0) {
+      fetchAvailableModels();
+    }
+  }, [showAddModal, availableModels.length, fetchAvailableModels]);
 
   const handleDeleteKey = async (id) => {
     setConfirmState({
@@ -1130,13 +1169,37 @@ export default function APIPageClient({ machineId }) {
           </div>
         ) : (
           <div className="flex flex-col">
-            {keys.map((key) => (
+            {keys.map((key) => {
+              const tier = key.tier || "unlimited";
+              const isUnlimited = tier === "unlimited";
+              const isExpired = key.expiresAt && new Date(key.expiresAt).getTime() < Date.now();
+              const tokenUsed = Number(key.tokenUsed || 0);
+              const tokenLimit = key.tokenLimit != null ? Number(key.tokenLimit) : null;
+              const usagePct = tokenLimit && tokenLimit > 0
+                ? Math.min(100, Math.round((tokenUsed / tokenLimit) * 100))
+                : null;
+              const allowedCount = Array.isArray(key.allowedModels) ? key.allowedModels.length : 0;
+              return (
               <div
                 key={key.id}
                 className={`group flex items-center justify-between py-3 border-b border-black/[0.03] dark:border-white/[0.03] last:border-b-0 ${key.isActive === false ? "opacity-60" : ""}`}
               >
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium">{key.name}</p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <p className="text-sm font-medium">{key.name}</p>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide ${
+                      isUnlimited
+                        ? "bg-purple-500/15 text-purple-600 dark:text-purple-400"
+                        : "bg-blue-500/15 text-blue-600 dark:text-blue-400"
+                    }`}>
+                      {isUnlimited ? "Unlimited" : "Restricted"}
+                    </span>
+                    {isExpired && !isUnlimited && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide bg-red-500/15 text-red-600 dark:text-red-400">
+                        Expired
+                      </span>
+                    )}
+                  </div>
                   <div className="flex items-center gap-2 mt-1">
                     <code className="text-xs text-text-muted font-mono">
                       {visibleKeys.has(key.id) ? key.key : maskKey(key.key)}
@@ -1159,9 +1222,38 @@ export default function APIPageClient({ machineId }) {
                       </span>
                     </button>
                   </div>
-                  <p className="text-xs text-text-muted mt-1">
-                    Created {new Date(key.createdAt).toLocaleDateString()}
-                  </p>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-text-muted">
+                    <span>Created {new Date(key.createdAt).toLocaleDateString()}</span>
+                    {!isUnlimited && key.expiresAt && (
+                      <span className={isExpired ? "text-red-500" : ""}>
+                        Expires {new Date(key.expiresAt).toLocaleDateString()}
+                      </span>
+                    )}
+                    {!isUnlimited && allowedCount > 0 && (
+                      <span>{allowedCount} model{allowedCount === 1 ? "" : "s"} allowed</span>
+                    )}
+                  </div>
+                  {!isUnlimited && tokenLimit != null && tokenLimit > 0 && (
+                    <div className="mt-2 max-w-md">
+                      <div className="flex items-center justify-between text-[11px] text-text-muted mb-1">
+                        <span>Tokens used</span>
+                        <span className="font-mono">
+                          {tokenUsed.toLocaleString()} / {tokenLimit.toLocaleString()}
+                          {usagePct != null && ` (${usagePct}%)`}
+                        </span>
+                      </div>
+                      <div className="h-1.5 bg-black/8 dark:bg-white/8 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full transition-all ${
+                            usagePct >= 100 ? "bg-red-500"
+                              : usagePct >= 80 ? "bg-orange-500"
+                              : "bg-primary"
+                          }`}
+                          style={{ width: `${usagePct ?? 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                   {key.isActive === false && (
                     <p className="text-xs text-orange-500 mt-1">Paused</p>
                   )}
@@ -1194,7 +1286,8 @@ export default function APIPageClient({ machineId }) {
                   </button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Card>
@@ -1206,6 +1299,10 @@ export default function APIPageClient({ machineId }) {
         onClose={() => {
           setShowAddModal(false);
           setNewKeyName("");
+          setNewKeyTier("restricted");
+          setNewKeyExpiresAt("");
+          setNewKeyTokenLimit("");
+          setNewKeyAllowedModels([]);
         }}
       >
         <div className="flex flex-col gap-4">
@@ -1215,6 +1312,98 @@ export default function APIPageClient({ machineId }) {
             onChange={(e) => setNewKeyName(e.target.value)}
             placeholder="Production Key"
           />
+
+          <div>
+            <label className="block text-sm font-medium mb-2">Tier</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setNewKeyTier("restricted")}
+                className={`px-3 py-2 rounded-lg border text-sm transition ${
+                  newKeyTier === "restricted"
+                    ? "border-primary bg-primary/10 text-primary font-medium"
+                    : "border-border text-text-muted hover:border-primary/50"
+                }`}
+              >
+                Restricted
+                <span className="block text-xs mt-0.5 opacity-70">Expiry · Quota · Allowlist</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setNewKeyTier("unlimited")}
+                className={`px-3 py-2 rounded-lg border text-sm transition ${
+                  newKeyTier === "unlimited"
+                    ? "border-primary bg-primary/10 text-primary font-medium"
+                    : "border-border text-text-muted hover:border-primary/50"
+                }`}
+              >
+                Unlimited
+                <span className="block text-xs mt-0.5 opacity-70">God mode · No limits</span>
+              </button>
+            </div>
+          </div>
+
+          {newKeyTier === "restricted" && (
+            <>
+              <Input
+                label="Expires At (optional)"
+                type="datetime-local"
+                value={newKeyExpiresAt}
+                onChange={(e) => setNewKeyExpiresAt(e.target.value)}
+              />
+              <Input
+                label="Token Limit (optional)"
+                type="number"
+                min="0"
+                value={newKeyTokenLimit}
+                onChange={(e) => setNewKeyTokenLimit(e.target.value)}
+                placeholder="e.g. 100000 (leave empty for unlimited tokens)"
+              />
+
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  Allowed Models{" "}
+                  <span className="text-text-muted font-normal">
+                    ({newKeyAllowedModels.length} selected, empty = all allowed)
+                  </span>
+                </label>
+                <div className="border border-border rounded-lg max-h-48 overflow-y-auto bg-surface-2">
+                  {availableModels.length === 0 ? (
+                    <div className="p-3 text-sm text-text-muted text-center">
+                      Loading models...
+                    </div>
+                  ) : (
+                    availableModels.map((modelId) => {
+                      const checked = newKeyAllowedModels.includes(modelId);
+                      return (
+                        <label
+                          key={modelId}
+                          className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-sm"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setNewKeyAllowedModels([...newKeyAllowedModels, modelId]);
+                              } else {
+                                setNewKeyAllowedModels(
+                                  newKeyAllowedModels.filter((m) => m !== modelId)
+                                );
+                              }
+                            }}
+                            className="rounded"
+                          />
+                          <code className="font-mono text-xs">{modelId}</code>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
           <div className="flex gap-2">
             <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
               Create
@@ -1223,6 +1412,10 @@ export default function APIPageClient({ machineId }) {
               onClick={() => {
                 setShowAddModal(false);
                 setNewKeyName("");
+                setNewKeyTier("restricted");
+                setNewKeyExpiresAt("");
+                setNewKeyTokenLimit("");
+                setNewKeyAllowedModels([]);
               }}
               variant="ghost"
               fullWidth

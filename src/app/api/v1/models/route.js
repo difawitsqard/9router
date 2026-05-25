@@ -10,6 +10,7 @@ import { getDisabledModels } from "@/lib/disabledModelsDb";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
 import { resolveApiKeyContext } from "@/sse/services/apiKeyPolicy.js";
 import { KEY_TIER, isModelAllowedForKey } from "@/lib/localDb";
+import { resolveProviderId } from "@/shared/constants/providers";
 
 // /v1/models reflects the caller's API key (allowlist filtering), so it cannot be
 // statically rendered. Force dynamic rendering on every request.
@@ -139,6 +140,41 @@ function comboMatchesKinds(combo, kindFilter) {
   return kindFilter.includes(kind);
 }
 
+// ─── Per-key account scope filter ──────────────────────────────────────
+// When the calling API key is restricted to specific provider connections, we
+// expose only providers they can actually use. Combos surface if at least one
+// sub-model's provider is reachable (Q4: partial allow keeps combos visible).
+function resolveAllowedProviderSet(keyContext, connections) {
+  if (!keyContext || keyContext.tier !== KEY_TIER.RESTRICTED) return null;
+  const allowed = keyContext.allowedConnectionIds;
+  if (!Array.isArray(allowed) || allowed.length === 0) return null;
+
+  const tokens = new Set(allowed);
+  const providerSet = new Set();
+  for (const conn of connections) {
+    if (conn?.id && tokens.has(conn.id)) providerSet.add(conn.provider);
+  }
+  for (const token of tokens) {
+    if (typeof token === "string" && token.startsWith("noauth:")) {
+      providerSet.add(token.slice(7));
+    }
+  }
+  return providerSet;
+}
+
+function comboHasAllowedProvider(combo, allowedProviderSet) {
+  if (!allowedProviderSet) return true;
+  const subs = combo?.models;
+  if (!Array.isArray(subs) || subs.length === 0) return true; // empty combo: defer to model allowlist
+  for (const m of subs) {
+    if (typeof m !== "string" || !m.includes("/")) continue;
+    const [aliasOrId] = m.split("/");
+    const providerId = resolveProviderId(aliasOrId) || aliasOrId;
+    if (allowedProviderSet.has(providerId)) return true;
+  }
+  return false;
+}
+
 /**
  * Build OpenAI-format models list filtered by service kinds.
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
@@ -183,8 +219,12 @@ export async function buildModelsList(kindFilter, keyContext = null) {
   }
   const isDisabled = (alias, modelId) => Array.isArray(disabledByAlias[alias]) && disabledByAlias[alias].includes(modelId);
 
+  // Provider-level scope from the calling key's allowedConnectionIds (null when not restricted).
+  const allowedProviderSet = resolveAllowedProviderSet(keyContext, connections);
+
   const activeConnectionByProvider = new Map();
   for (const conn of connections) {
+    if (allowedProviderSet && !allowedProviderSet.has(conn.provider)) continue;
     if (!activeConnectionByProvider.has(conn.provider)) {
       activeConnectionByProvider.set(conn.provider, conn);
     }
@@ -195,6 +235,7 @@ export async function buildModelsList(kindFilter, keyContext = null) {
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
+    if (!comboHasAllowedProvider(combo, allowedProviderSet)) continue;
     const entry = {
       id: combo.name,
       object: "model",
@@ -214,6 +255,7 @@ export async function buildModelsList(kindFilter, keyContext = null) {
     for (const [alias, providerModels] of Object.entries(PROVIDER_MODELS)) {
       const providerId = aliasToProviderId[alias] || alias;
       if (!providerMatchesKinds(providerId, kindFilter)) continue;
+      if (allowedProviderSet && !allowedProviderSet.has(providerId)) continue;
       for (const model of providerModels) {
         if (!kindFilter.includes(modelKind(model))) continue;
         if (isDisabled(alias, model.id)) continue;

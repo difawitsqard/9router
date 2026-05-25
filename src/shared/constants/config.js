@@ -1,9 +1,11 @@
 import pkg from "../../../package.json" with { type: "json" };
+import { getBrandName, getBrandTagline } from "@/shared/utils/branding";
 
-// App configuration
+// App configuration — name & description honour env-based branding overrides.
+// Override via NEXT_PUBLIC_APP_NAME / NEXT_PUBLIC_APP_TAGLINE in .env (see .env.example).
 export const APP_CONFIG = {
-  name: "9Router Proxy",
-  description: "AI Infrastructure Management",
+  get name() { return getBrandName(); },
+  get description() { return getBrandTagline(); },
   version: pkg.version,
 };
 

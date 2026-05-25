@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getApiKeys, createApiKey, KEY_TIER } from "@/lib/localDb";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { validateAllowedConnectionIds } from "@/lib/auth/allowedConnections";
 
 export const dynamic = "force-dynamic";
 
@@ -19,7 +20,7 @@ export async function GET() {
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { name, tier, expiresAt, tokenLimit, allowedModels } = body;
+    const { name, tier, expiresAt, tokenLimit, allowedModels, allowedConnectionIds } = body;
 
     if (!name) {
       return NextResponse.json({ error: "Name is required" }, { status: 400 });
@@ -45,6 +46,12 @@ export async function POST(request) {
       return NextResponse.json({ error: "allowedModels must be an array of model ids" }, { status: 400 });
     }
 
+    // Validate allowedConnectionIds if provided
+    const accountValidation = await validateAllowedConnectionIds(allowedConnectionIds);
+    if (!accountValidation.ok) {
+      return NextResponse.json({ error: accountValidation.error }, { status: 400 });
+    }
+
     // Always get machineId from server
     const machineId = await getConsistentMachineId();
     const apiKey = await createApiKey(name, machineId, {
@@ -52,6 +59,7 @@ export async function POST(request) {
       expiresAt: expiresAt || null,
       tokenLimit: tokenLimit ?? null,
       allowedModels: allowedModels || [],
+      allowedConnectionIds: accountValidation.list,
     });
 
     return NextResponse.json({
@@ -64,6 +72,7 @@ export async function POST(request) {
       tokenLimit: apiKey.tokenLimit,
       tokenUsed: apiKey.tokenUsed,
       allowedModels: apiKey.allowedModels,
+      allowedConnectionIds: apiKey.allowedConnectionIds,
       status: apiKey.status,
     }, { status: 201 });
   } catch (error) {

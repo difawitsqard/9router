@@ -1,7 +1,7 @@
 import {
   getProviderCredentials, markAccountUnavailable,
 } from "../services/auth.js";
-import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
+import { enforceApiKeyPolicy, assertModelAllowed, resolveAllowedConnectionSet } from "../services/apiKeyPolicy.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleTtsCore } from "open-sse/handlers/ttsCore.js";
@@ -35,6 +35,7 @@ export async function handleTts(request) {
   const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
   if (!policy.ok) return policy.response;
   const keyContext = policy.keyContext;
+  const allowedConnectionIds = resolveAllowedConnectionSet(keyContext);
 
   const settings = await getSettings();
 
@@ -54,7 +55,7 @@ export async function handleTts(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language),
+      handleSingleModel: (b, m) => handleSingleModelTts(b, m, responseFormat, language, allowedConnectionIds),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -65,10 +66,10 @@ export async function handleTts(request) {
   const denied = assertModelAllowed(keyContext, modelStr, "AUTH");
   if (denied) return denied;
 
-  return handleSingleModelTts(body, modelStr, responseFormat, language);
+  return handleSingleModelTts(body, modelStr, responseFormat, language, allowedConnectionIds);
 }
 
-async function handleSingleModelTts(body, modelStr, responseFormat, language) {
+async function handleSingleModelTts(body, modelStr, responseFormat, language, allowedConnectionIds = null) {
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 

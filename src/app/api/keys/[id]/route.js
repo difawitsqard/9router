@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteApiKey, getApiKeyById, updateApiKey, KEY_TIER } from "@/lib/localDb";
+import { validateAllowedConnectionIds } from "@/lib/auth/allowedConnections";
 
 // GET /api/keys/[id] - Get single key
 export async function GET(request, { params }) {
@@ -21,7 +22,7 @@ export async function PUT(request, { params }) {
   try {
     const { id } = await params;
     const body = await request.json();
-    const { isActive, name, tier, expiresAt, tokenLimit, allowedModels } = body;
+    const { isActive, name, tier, expiresAt, tokenLimit, allowedModels, allowedConnectionIds } = body;
 
     const existing = await getApiKeyById(id);
     if (!existing) {
@@ -51,6 +52,16 @@ export async function PUT(request, { params }) {
       return NextResponse.json({ error: "allowedModels must be an array of model ids" }, { status: 400 });
     }
 
+    // Validate allowedConnectionIds (null = clear scope)
+    let validatedAllowedConnectionIds;
+    if (allowedConnectionIds !== undefined) {
+      const result = await validateAllowedConnectionIds(allowedConnectionIds);
+      if (!result.ok) {
+        return NextResponse.json({ error: result.error }, { status: 400 });
+      }
+      validatedAllowedConnectionIds = result.list;
+    }
+
     const updateData = {};
     if (isActive !== undefined) updateData.isActive = isActive;
     if (name !== undefined) updateData.name = name;
@@ -58,6 +69,7 @@ export async function PUT(request, { params }) {
     if (expiresAt !== undefined) updateData.expiresAt = expiresAt;
     if (tokenLimit !== undefined) updateData.tokenLimit = tokenLimit;
     if (allowedModels !== undefined) updateData.allowedModels = allowedModels;
+    if (allowedConnectionIds !== undefined) updateData.allowedConnectionIds = validatedAllowedConnectionIds;
 
     const updated = await updateApiKey(id, updateData);
 

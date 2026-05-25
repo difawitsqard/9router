@@ -34,6 +34,45 @@ function serializeAllowedModels(value) {
   return list.length > 0 ? JSON.stringify(list) : null;
 }
 
+// ─── Allowed Connection IDs ─────────────────────────────────────────────
+// Allowlist entries can be either:
+//   • UUID v4 string  → references a row in providerConnections
+//   • "noauth:<provider>" → pseudo-id for auth-less providers (Kiro, OpenCode Free, …)
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const NOAUTH_RE = /^noauth:[a-z0-9_-]+$/i;
+
+function isValidConnectionToken(value) {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  return UUID_RE.test(v) || NOAUTH_RE.test(v);
+}
+
+function parseAllowedConnectionIds(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const list = parsed.filter(isValidConnectionToken).map((s) => s.trim());
+    return list.length > 0 ? list : null;
+  } catch {
+    return null;
+  }
+}
+
+function serializeAllowedConnectionIds(value) {
+  if (!Array.isArray(value)) return null;
+  const seen = new Set();
+  const list = [];
+  for (const v of value) {
+    if (!isValidConnectionToken(v)) continue;
+    const t = v.trim();
+    if (seen.has(t)) continue;
+    seen.add(t);
+    list.push(t);
+  }
+  return list.length > 0 ? JSON.stringify(list) : null;
+}
+
 function normalizeTier(raw) {
   // Legacy keys (null) → unlimited (zero behavior change for existing keys)
   if (raw === KEY_TIER.UNLIMITED || raw === KEY_TIER.RESTRICTED) return raw;
@@ -55,6 +94,7 @@ function rowToKey(row) {
     tokenLimit: row.tokenLimit == null ? null : Number(row.tokenLimit),
     tokenUsed: row.tokenUsed == null ? 0 : Number(row.tokenUsed),
     allowedModels: parseAllowedModels(row.allowedModels),
+    allowedConnectionIds: parseAllowedConnectionIds(row.allowedConnectionIds),
   };
 }
 
@@ -128,6 +168,7 @@ export async function createApiKey(name, machineId, options = {}) {
       ? Math.max(0, Math.floor(Number(options.tokenLimit)))
       : null;
   const allowedModelsJson = serializeAllowedModels(options.allowedModels);
+  const allowedConnectionIdsJson = serializeAllowedConnectionIds(options.allowedConnectionIds);
   const now = new Date().toISOString();
 
   const apiKey = {
@@ -143,15 +184,16 @@ export async function createApiKey(name, machineId, options = {}) {
     tokenLimit,
     tokenUsed: 0,
     allowedModels: parseAllowedModels(allowedModelsJson),
+    allowedConnectionIds: parseAllowedConnectionIds(allowedConnectionIdsJson),
   };
 
   db.run(
-    `INSERT INTO apiKeys(id, key, name, machineId, isActive, createdAt, updatedAt, tier, expiresAt, tokenLimit, tokenUsed, allowedModels)
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO apiKeys(id, key, name, machineId, isActive, createdAt, updatedAt, tier, expiresAt, tokenLimit, tokenUsed, allowedModels, allowedConnectionIds)
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       apiKey.id, apiKey.key, apiKey.name, apiKey.machineId, 1,
       apiKey.createdAt, apiKey.updatedAt,
-      tier, expiresAt, tokenLimit, 0, allowedModelsJson,
+      tier, expiresAt, tokenLimit, 0, allowedModelsJson, allowedConnectionIdsJson,
     ]
   );
 
@@ -188,6 +230,10 @@ export async function updateApiKey(id, data) {
         data.allowedModels === undefined
           ? current.allowedModels
           : Array.isArray(data.allowedModels) ? data.allowedModels : null,
+      allowedConnectionIds:
+        data.allowedConnectionIds === undefined
+          ? current.allowedConnectionIds
+          : Array.isArray(data.allowedConnectionIds) ? data.allowedConnectionIds : null,
       tokenUsed:
         data.tokenUsed === undefined
           ? current.tokenUsed
@@ -199,7 +245,7 @@ export async function updateApiKey(id, data) {
     db.run(
       `UPDATE apiKeys
          SET name = ?, isActive = ?, tier = ?, expiresAt = ?, tokenLimit = ?,
-             tokenUsed = ?, allowedModels = ?, updatedAt = ?
+             tokenUsed = ?, allowedModels = ?, allowedConnectionIds = ?, updatedAt = ?
        WHERE id = ?`,
       [
         next.name,
@@ -209,6 +255,7 @@ export async function updateApiKey(id, data) {
         next.tokenLimit,
         next.tokenUsed,
         serializeAllowedModels(next.allowedModels),
+        serializeAllowedConnectionIds(next.allowedConnectionIds),
         updatedAt,
         id,
       ]
@@ -323,5 +370,45 @@ export function isModelAllowedForKey(key, modelId) {
   if (!Array.isArray(key.allowedModels) || key.allowedModels.length === 0) return true;
   if (!modelId) return true;
   return key.allowedModels.includes(modelId);
+}
+
+/**
+ * Check whether a provider connection (or noauth pseudo-id) is allowed for a key.
+ *
+ * @param {object|null} key - resolved key object (from validateApiKey/getApiKey…)
+ * @param {object|string|null} conn - one of:
+ *     • a connection row/object: { id, provider, ... }
+ *     • a string UUID
+ *     • a string "noauth:<provider>"
+ * @returns {boolean}
+ *
+ * Rules:
+ *  - tier 'unlimited' (god mode) → always true
+ *  - allowlist null/empty       → always true (legacy / no restriction)
+ *  - connection object with id  → match against UUIDs in allowlist
+ *  - connection object with provider but no id (noAuth virtual) → match "noauth:<provider>"
+ *  - bare string                → match as-is
+ */
+export function isConnectionAllowedForKey(key, conn) {
+  if (!key) return false;
+  if (key.tier === KEY_TIER.UNLIMITED) return true;
+  const allow = Array.isArray(key.allowedConnectionIds) ? key.allowedConnectionIds : null;
+  if (!allow || allow.length === 0) return true;
+
+  if (conn == null) return false;
+
+  if (typeof conn === "string") {
+    return allow.includes(conn.trim());
+  }
+
+  // Object form
+  if (conn.id && typeof conn.id === "string" && conn.id !== "noauth") {
+    if (allow.includes(conn.id)) return true;
+  }
+  if (conn.provider && typeof conn.provider === "string") {
+    const noauthToken = `noauth:${conn.provider}`;
+    if (allow.includes(noauthToken)) return true;
+  }
+  return false;
 }
 

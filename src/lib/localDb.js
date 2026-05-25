@@ -13,7 +13,7 @@ export {
   getApiKeys, getApiKeyById, getApiKeyByKey,
   createApiKey, updateApiKey, deleteApiKey,
   resetApiKeyUsage, incrementTokenUsed,
-  validateApiKey, isModelAllowedForKey,
+  validateApiKey, isModelAllowedForKey, isConnectionAllowedForKey,
   KEY_TIER, VALIDATION_REASON,
   getCombos, getComboById, getComboByName,
   createCombo, updateCombo, deleteCombo,

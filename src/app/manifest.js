@@ -1,8 +1,10 @@
+import { getBrandFullTitle, getBrandShortName, getBrandDescription } from "@/shared/utils/branding";
+
 export default function manifest() {
   return {
-    name: '9Router - AI Infrastructure Management',
-    short_name: '9Router',
-    description: 'One endpoint for all your AI providers. Manage keys, monitor usage, and scale effortlessly.',
+    name: getBrandFullTitle(),
+    short_name: getBrandShortName(),
+    description: getBrandDescription(),
     start_url: '/',
     display: 'standalone',
     background_color: '#0a0a0a',

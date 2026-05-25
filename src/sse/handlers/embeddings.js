@@ -3,7 +3,7 @@ import {
   markAccountUnavailable,
   clearAccountError,
 } from "../services/auth.js";
-import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
+import { enforceApiKeyPolicy, assertModelAllowed, resolveAllowedConnectionSet } from "../services/apiKeyPolicy.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo } from "../services/model.js";
 import { handleEmbeddingsCore } from "open-sse/handlers/embeddingsCore.js";
@@ -36,6 +36,7 @@ export async function handleEmbeddings(request) {
   const policy = await enforceApiKeyPolicy(request, { label: "AUTH" });
   if (!policy.ok) return policy.response;
   const keyContext = policy.keyContext;
+  const allowedConnectionIds = resolveAllowedConnectionSet(keyContext);
 
   if (!modelStr) {
     log.warn("EMBEDDINGS", "Missing model");
@@ -70,7 +71,7 @@ export async function handleEmbeddings(request) {
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { allowedConnectionIds });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {

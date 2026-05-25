@@ -3,7 +3,7 @@ import {
   markAccountUnavailable,
   clearAccountError,
 } from "../services/auth.js";
-import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
+import { enforceApiKeyPolicy, assertModelAllowed, resolveAllowedConnectionSet } from "../services/apiKeyPolicy.js";
 import { getSettings, getCombos } from "@/lib/localDb";
 import { AI_PROVIDERS, resolveProviderId } from "@/shared/constants/providers.js";
 import { handleSearchCore } from "open-sse/handlers/search/index.js";
@@ -40,6 +40,7 @@ export async function handleSearch(request) {
   if (!policy.ok) return policy.response;
   const apiKey = policy.apiKey;
   const keyContext = policy.keyContext;
+  const allowedConnectionIds = resolveAllowedConnectionSet(keyContext);
 
   const settings = await getSettings();
 
@@ -68,7 +69,7 @@ export async function handleSearch(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings),
+      handleSingleModel: (b, m) => handleSingleProviderSearch(b, m, request, apiKey, settings, allowedConnectionIds),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -80,10 +81,10 @@ export async function handleSearch(request) {
   const denied = assertModelAllowed(keyContext, providerInput, "AUTH");
   if (denied) return denied;
 
-  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings);
+  return handleSingleProviderSearch(body, providerInput, request, apiKey, settings, allowedConnectionIds);
 }
 
-async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings) {
+async function handleSingleProviderSearch(body, providerInput, request, apiKey, settings, allowedConnectionIds = null) {
   const query = body.query;
   const providerId = resolveProviderId(providerInput);
   const resolvedProvider = AI_PROVIDERS[providerId];

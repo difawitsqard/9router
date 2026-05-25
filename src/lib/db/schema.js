@@ -85,6 +85,7 @@ export const TABLES = {
       tokenLimit: "INTEGER",        // total token quota; null → unlimited
       tokenUsed: "INTEGER DEFAULT 0",
       allowedModels: "TEXT",        // JSON array of model ids; null/empty → all allowed
+      allowedConnectionIds: "TEXT", // JSON array of provider connection UUIDs or "noauth:<provider>" tokens; null/empty → all accounts allowed
       updatedAt: "TEXT",
     },
     indexes: [

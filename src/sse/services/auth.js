@@ -21,6 +21,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  // Optional account allowlist (from API key policy). null/empty = no restriction.
+  const allowedConnectionIds = options?.allowedConnectionIds instanceof Set
+    ? options.allowedConnectionIds
+    : (Array.isArray(options?.allowedConnectionIds) && options.allowedConnectionIds.length > 0
+      ? new Set(options.allowedConnectionIds)
+      : null);
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -64,8 +70,19 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      // Account allowlist (from API key policy)
+      if (allowedConnectionIds) {
+        const noauthToken = `noauth:${providerId}`;
+        if (!allowedConnectionIds.has(c.id) && !allowedConnectionIds.has(noauthToken)) {
+          return false;
+        }
+      }
       return true;
     });
+
+    if (allowedConnectionIds) {
+      log.debug("AUTH", `${provider} | account allowlist active (size=${allowedConnectionIds.size}) → ${availableConnections.length} match`);
+    }
 
     log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${connections.length}`);
     connections.forEach(c => {

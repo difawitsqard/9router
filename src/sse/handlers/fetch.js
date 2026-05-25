@@ -3,7 +3,7 @@ import {
   markAccountUnavailable,
   clearAccountError,
 } from "../services/auth.js";
-import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
+import { enforceApiKeyPolicy, assertModelAllowed, resolveAllowedConnectionSet } from "../services/apiKeyPolicy.js";
 import { getSettings, getCombos } from "@/lib/localDb";
 import { AI_PROVIDERS, resolveProviderId } from "@/shared/constants/providers.js";
 import { handleFetchCore } from "open-sse/handlers/fetch/index.js";
@@ -42,6 +42,7 @@ export async function handleFetch(request) {
   if (!policy.ok) return policy.response;
   const apiKey = policy.apiKey;
   const keyContext = policy.keyContext;
+  const allowedConnectionIds = resolveAllowedConnectionSet(keyContext);
 
   const settings = await getSettings();
 
@@ -78,7 +79,7 @@ export async function handleFetch(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleProviderFetch(b, m, request, apiKey, settings),
+      handleSingleModel: (b, m) => handleSingleProviderFetch(b, m, request, apiKey, settings, allowedConnectionIds),
       log,
       comboName: providerInput,
       comboStrategy,
@@ -90,10 +91,10 @@ export async function handleFetch(request) {
   const denied = assertModelAllowed(keyContext, providerInput, "AUTH");
   if (denied) return denied;
 
-  return handleSingleProviderFetch(body, providerInput, request, apiKey, settings);
+  return handleSingleProviderFetch(body, providerInput, request, apiKey, settings, allowedConnectionIds);
 }
 
-async function handleSingleProviderFetch(body, providerInput, request, apiKey, settings) {
+async function handleSingleProviderFetch(body, providerInput, request, apiKey, settings, allowedConnectionIds = null) {
   const targetUrl = body.url;
   const format = body.format;
   const maxCharacters = body.max_characters;

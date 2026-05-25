@@ -5,7 +5,7 @@ import {
   markAccountUnavailable,
   clearAccountError,
 } from "../services/auth.js";
-import { enforceApiKeyPolicy, assertModelAllowed } from "../services/apiKeyPolicy.js";
+import { enforceApiKeyPolicy, assertModelAllowed, resolveAllowedConnectionSet } from "../services/apiKeyPolicy.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
@@ -60,6 +60,7 @@ export async function handleChat(request, clientRawRequest = null) {
   if (!policy.ok) return policy.response;
   const apiKey = policy.apiKey;
   const keyContext = policy.keyContext;
+  const allowedConnectionIds = resolveAllowedConnectionSet(keyContext);
 
   const settings = await getSettings();
 
@@ -90,7 +91,7 @@ export async function handleChat(request, clientRawRequest = null) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+      handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, allowedConnectionIds),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -102,13 +103,13 @@ export async function handleChat(request, clientRawRequest = null) {
   const denied = assertModelAllowed(keyContext, modelStr, "AUTH");
   if (denied) return denied;
 
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, allowedConnectionIds);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, allowedConnectionIds = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -126,7 +127,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        handleSingleModel: (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, allowedConnectionIds),
         log,
         comboName: modelStr,
         comboStrategy,
@@ -155,7 +156,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { allowedConnectionIds });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -166,6 +167,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
       }
       if (excludeConnectionIds.size === 0) {
+        if (allowedConnectionIds && allowedConnectionIds.size > 0) {
+          log.warn("AUTH", `No allowed account for provider: ${provider} (key scope mismatch)`);
+          return errorResponse(HTTP_STATUS.FORBIDDEN, `This API key is not allowed to use any account for provider: ${provider}`);
+        }
         log.warn("AUTH", `No active credentials for provider: ${provider}`);
         return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
       }

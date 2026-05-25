@@ -1,5 +1,5 @@
 import { extractApiKey } from "./auth.js";
-import { validateApiKey, isModelAllowedForKey, KEY_TIER, VALIDATION_REASON } from "@/lib/localDb";
+import { validateApiKey, isModelAllowedForKey, isConnectionAllowedForKey, KEY_TIER, VALIDATION_REASON } from "@/lib/localDb";
 import { getSettings } from "@/lib/localDb";
 import { errorResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
@@ -164,4 +164,47 @@ export function assertModelAllowed(keyContext, models, label = "AUTH") {
     }
   }
   return null;
+}
+
+/**
+ * Resolve the effective account allowlist for a key as a Set, ready to pass
+ * into `getProviderCredentials({ allowedConnectionIds })`.
+ *
+ * Returns null when no restriction should be applied (bypass / unlimited /
+ * empty allowlist) so the picker can short-circuit.
+ *
+ * @param {object|null} keyContext
+ * @returns {Set<string>|null}
+ */
+export function resolveAllowedConnectionSet(keyContext) {
+  if (!keyContext) return null;
+  if (keyContext.tier !== KEY_TIER.RESTRICTED) return null;
+  const list = Array.isArray(keyContext.allowedConnectionIds) ? keyContext.allowedConnectionIds : null;
+  if (!list || list.length === 0) return null;
+  return new Set(list);
+}
+
+/**
+ * Defense-in-depth: assert a chosen connection is allowed for the key.
+ * Useful when the picker is bypassed (preferred id, or a free/no-auth path).
+ *
+ * @param {object|null} keyContext
+ * @param {object|string|null} conn - connection object {id, provider} or string token
+ * @param {string} [label='AUTH']
+ * @returns {Response|null}
+ */
+export function assertAccountAllowed(keyContext, conn, label = "AUTH") {
+  if (!keyContext) return null;
+  if (keyContext.tier !== KEY_TIER.RESTRICTED) return null;
+  if (!Array.isArray(keyContext.allowedConnectionIds) || keyContext.allowedConnectionIds.length === 0) return null;
+  if (isConnectionAllowedForKey(keyContext, conn)) return null;
+
+  const label2 = typeof conn === "object" && conn?.provider
+    ? `${conn.provider}/${conn.id ? conn.id.slice(0, 8) : "noauth"}`
+    : String(conn);
+  log.warn(label, `Account not allowed for key (id=${keyContext.id?.slice(0, 8)}, account=${label2})`);
+  return errorResponse(
+    HTTP_STATUS.FORBIDDEN,
+    `Account '${label2}' is not allowed for this API key`
+  );
 }

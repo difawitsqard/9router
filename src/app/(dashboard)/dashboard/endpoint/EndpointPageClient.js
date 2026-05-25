@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
 import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { getBrandName } from "@/shared/utils/branding";
 
 const TUNNEL_BENEFITS = [
   { icon: "public", title: "Access Anywhere", desc: "Use your API from any network" },
@@ -63,6 +64,10 @@ export default function APIPageClient({ machineId }) {
   const [newKeyTokenLimit, setNewKeyTokenLimit] = useState("");
   const [newKeyAllowedModels, setNewKeyAllowedModels] = useState([]);
   const [availableModels, setAvailableModels] = useState([]);
+  // Per-key account scope (Phase 6)
+  const [availableConnections, setAvailableConnections] = useState([]); // [{id, provider, name|email|...}]
+  const [noAuthProviders, setNoAuthProviders] = useState([]); // [{id, name}]
+  const [newKeyAllowedConnectionIds, setNewKeyAllowedConnectionIds] = useState(null); // null = all, [] = pick mode
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
@@ -134,64 +139,9 @@ export default function APIPageClient({ machineId }) {
     if (tsLogRef.current) tsLogRef.current.scrollTop = tsLogRef.current.scrollHeight;
   }, [tsInstallLog]);
 
-  useEffect(() => {
-    fetchData();
-    loadSettings();
-  }, []);
-
-  // Status poll: only while degraded (not yet reachable). Stop once healthy to avoid spam.
-  // Visibility re-check: refresh once when tab becomes visible.
-  useEffect(() => {
-    const anyEnabled = tunnelEnabled || tsEnabled;
-    if (!anyEnabled) return;
-    const tunnelHealthy = !tunnelEnabled || tunnelReachable;
-    const tsHealthy = !tsEnabled || tsReachable;
-    const allHealthy = tunnelHealthy && tsHealthy;
-    const onVisible = () => { if (!document.hidden) syncTunnelStatus(); };
-    document.addEventListener("visibilitychange", onVisible);
-    if (allHealthy) return () => document.removeEventListener("visibilitychange", onVisible);
-    const timer = setInterval(() => { if (!document.hidden) syncTunnelStatus(); }, STATUS_POLL_FAST_MS);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [tunnelEnabled, tsEnabled, tunnelReachable, tsReachable]);
-
-  // Browser-side periodic ping: probes tunnel/tailscale URLs directly so UI stays
-  // "reachable" even when backend DNS (1.1.1.1) hiccups on *.ts.net or *.trycloudflare.com.
-  // Adaptive: slow when healthy, fast when degraded; pause when tab hidden.
-  useEffect(() => {
-    const probeBoth = async () => {
-      if (document.hidden) return;
-      if (tunnelEnabled && (tunnelUrl || tunnelPublicUrl)) {
-        const ok = await clientPingAny(tunnelPublicUrl, tunnelUrl);
-        tunnelClientReachableRef.current = ok;
-        if (ok) { tunnelMissRef.current = 0; setTunnelReachable(true); if (!tunnelEverReachableRef.current) { tunnelEverReachableRef.current = true; setTunnelEverReachable(true); } }
-        else { tunnelMissRef.current += 1; if (tunnelMissRef.current >= REACHABLE_MISS_THRESHOLD) setTunnelReachable(false); }
-      } else {
-        tunnelClientReachableRef.current = false;
-      }
-      if (tsEnabled && tsUrl) {
-        const ok = await clientPingUrl(tsUrl);
-        tsClientReachableRef.current = ok;
-        if (ok) { tsMissRef.current = 0; setTsReachable(true); if (!tsEverReachableRef.current) { tsEverReachableRef.current = true; setTsEverReachable(true); } }
-        else { tsMissRef.current += 1; if (tsMissRef.current >= REACHABLE_MISS_THRESHOLD) setTsReachable(false); }
-      } else {
-        tsClientReachableRef.current = false;
-      }
-    };
-    const anyEnabled = (tunnelEnabled && (tunnelUrl || tunnelPublicUrl)) || (tsEnabled && tsUrl);
-    if (!anyEnabled) return;
-    probeBoth();
-    const tunnelHealthy = !tunnelEnabled || tunnelReachable;
-    const tsHealthy = !tsEnabled || tsReachable;
-    if (tunnelHealthy && tsHealthy) return;
-    const id = setInterval(probeBoth, CLIENT_PING_FAST_MS);
-    return () => clearInterval(id);
-  }, [tunnelEnabled, tunnelUrl, tunnelPublicUrl, tsEnabled, tsUrl, tunnelReachable, tsReachable]);
-
-  // Client-side reachable only (server no longer probes; watchdog handles backend health).
-  // Miss-debounce: only flip to false after N consecutive misses.
+  // ── Stable callbacks consumed by mount + status-poll + visibility effects ──
+  // Declared up here so the effects below see hoisted references and pass
+  // react-hooks/immutability + react-hooks/exhaustive-deps lint rules.
   const updateReachable = useCallback((_unused, clientRef, missRef, setter, everRef, everSetter) => {
     const reachable = clientRef.current;
     if (reachable) {
@@ -208,7 +158,7 @@ export default function APIPageClient({ machineId }) {
   }, []);
 
   // Trust user intent (settingsEnabled): UI stays "enabled" while watchdog restarts process
-  const syncTunnelStatus = async () => {
+  const syncTunnelStatus = useCallback(async () => {
     try {
       const statusRes = await fetch("/api/tunnel/status", { cache: "no-store" });
       if (!statusRes.ok) return;
@@ -226,9 +176,9 @@ export default function APIPageClient({ machineId }) {
       setTsEnabled(tsEn);
       updateReachable(null, tsClientReachableRef, tsMissRef, setTsReachable, tsEverReachableRef, setTsEverReachable);
     } catch { /* ignore poll errors */ }
-  };
+  }, [updateReachable]);
 
-  const loadSettings = async () => {
+  const loadSettings = useCallback(async () => {
     setTunnelChecking(true);
     try {
       const [settingsRes, statusRes] = await Promise.all([
@@ -265,7 +215,77 @@ export default function APIPageClient({ machineId }) {
     } finally {
       setTunnelChecking(false);
     }
-  };
+  }, [updateReachable]);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const keysRes = await fetch("/api/keys");
+      const keysData = await keysRes.json();
+      if (keysRes.ok) {
+        setKeys(keysData.keys || []);
+      }
+    } catch (error) {
+      console.log("Error fetching data:", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+    loadSettings();
+  }, [fetchData, loadSettings]);
+
+  // Status poll: only while degraded (not yet reachable). Stop once healthy to avoid spam.
+  // Visibility re-check: refresh once when tab becomes visible.
+  useEffect(() => {
+    const anyEnabled = tunnelEnabled || tsEnabled;
+    if (!anyEnabled) return;
+    const tunnelHealthy = !tunnelEnabled || tunnelReachable;
+    const tsHealthy = !tsEnabled || tsReachable;
+    const allHealthy = tunnelHealthy && tsHealthy;
+    const onVisible = () => { if (!document.hidden) syncTunnelStatus(); };
+    document.addEventListener("visibilitychange", onVisible);
+    if (allHealthy) return () => document.removeEventListener("visibilitychange", onVisible);
+    const timer = setInterval(() => { if (!document.hidden) syncTunnelStatus(); }, STATUS_POLL_FAST_MS);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [tunnelEnabled, tsEnabled, tunnelReachable, tsReachable, syncTunnelStatus]);
+
+  // Browser-side periodic ping: probes tunnel/tailscale URLs directly so UI stays
+  // "reachable" even when backend DNS (1.1.1.1) hiccups on *.ts.net or *.trycloudflare.com.
+  // Adaptive: slow when healthy, fast when degraded; pause when tab hidden.
+  useEffect(() => {
+    const probeBoth = async () => {
+      if (document.hidden) return;
+      if (tunnelEnabled && (tunnelUrl || tunnelPublicUrl)) {
+        const ok = await clientPingAny(tunnelPublicUrl, tunnelUrl);
+        tunnelClientReachableRef.current = ok;
+        if (ok) { tunnelMissRef.current = 0; setTunnelReachable(true); if (!tunnelEverReachableRef.current) { tunnelEverReachableRef.current = true; setTunnelEverReachable(true); } }
+        else { tunnelMissRef.current += 1; if (tunnelMissRef.current >= REACHABLE_MISS_THRESHOLD) setTunnelReachable(false); }
+      } else {
+        tunnelClientReachableRef.current = false;
+      }
+      if (tsEnabled && tsUrl) {
+        const ok = await clientPingUrl(tsUrl);
+        tsClientReachableRef.current = ok;
+        if (ok) { tsMissRef.current = 0; setTsReachable(true); if (!tsEverReachableRef.current) { tsEverReachableRef.current = true; setTsEverReachable(true); } }
+        else { tsMissRef.current += 1; if (tsMissRef.current >= REACHABLE_MISS_THRESHOLD) setTsReachable(false); }
+      } else {
+        tsClientReachableRef.current = false;
+      }
+    };
+    const anyEnabled = (tunnelEnabled && (tunnelUrl || tunnelPublicUrl)) || (tsEnabled && tsUrl);
+    if (!anyEnabled) return;
+    probeBoth();
+    const tunnelHealthy = !tunnelEnabled || tunnelReachable;
+    const tsHealthy = !tsEnabled || tsReachable;
+    if (tunnelHealthy && tsHealthy) return;
+    const id = setInterval(probeBoth, CLIENT_PING_FAST_MS);
+    return () => clearInterval(id);
+  }, [tunnelEnabled, tunnelUrl, tunnelPublicUrl, tsEnabled, tsUrl, tunnelReachable, tsReachable]);
 
   const handleTunnelDashboardAccess = async (value) => {
     try {
@@ -326,20 +346,6 @@ export default function APIPageClient({ machineId }) {
   const handleCavemanLevel = (level) => {
     setCavemanLevel(level);
     patchSetting({ cavemanLevel: level });
-  };
-
-  const fetchData = async () => {
-    try {
-      const keysRes = await fetch("/api/keys");
-      const keysData = await keysRes.json();
-      if (keysRes.ok) {
-        setKeys(keysData.keys || []);
-      }
-    } catch (error) {
-      console.log("Error fetching data:", error);
-    } finally {
-      setLoading(false);
-    }
   };
 
   // u2500u2500u2500 Cloudflare Tunnel handlers
@@ -696,6 +702,10 @@ export default function APIPageClient({ machineId }) {
           ? Number(newKeyTokenLimit)
           : null,
         allowedModels: newKeyTier === "restricted" ? newKeyAllowedModels : [],
+        // null  = all accounts allowed (no scope)
+        // []    = scoped, but nothing selected → key cannot use any account
+        // [...] = scoped to listed UUIDs / noauth:<provider> tokens
+        allowedConnectionIds: newKeyTier === "restricted" ? newKeyAllowedConnectionIds : null,
       };
       const res = await fetch("/api/keys", {
         method: "POST",
@@ -712,6 +722,7 @@ export default function APIPageClient({ machineId }) {
         setNewKeyExpiresAt("");
         setNewKeyTokenLimit("");
         setNewKeyAllowedModels([]);
+        setNewKeyAllowedConnectionIds(null);
         setShowAddModal(false);
       }
     } catch (error) {
@@ -732,11 +743,45 @@ export default function APIPageClient({ machineId }) {
     }
   }, []);
 
+  // Lazy-load provider connections when modal opens (per-key account scope).
+  // No-auth providers come from a small static list mirroring FREE_PROVIDERS in shared/constants/providers.js.
+  const fetchAvailableConnections = useCallback(async () => {
+    try {
+      const res = await fetch("/api/providers", { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        const list = Array.isArray(data?.connections) ? data.connections : (Array.isArray(data) ? data : []);
+        setAvailableConnections(list.filter((c) => c?.id && c?.provider));
+      }
+      // Static no-auth provider list. Mirrors FREE_PROVIDERS keys (kiro, opencode, searxng, …).
+      // Kept here intentionally so we don't depend on a server endpoint that may not exist.
+      setNoAuthProviders([
+        { id: "kiro", name: "Kiro" },
+        { id: "opencode", name: "OpenCode Free" },
+        { id: "local-device", name: "Local Device TTS" },
+        { id: "google-tts", name: "Google TTS" },
+        { id: "edge-tts", name: "Edge TTS" },
+        { id: "searxng", name: "SearXNG" },
+      ]);
+    } catch (error) {
+      console.log("Error fetching provider connections:", error);
+    }
+  }, []);
+
   useEffect(() => {
     if (showAddModal && availableModels.length === 0) {
       fetchAvailableModels();
     }
   }, [showAddModal, availableModels.length, fetchAvailableModels]);
+
+  useEffect(() => {
+    if (showAddModal) {
+      fetchAvailableConnections();
+      // Initialise allowedConnectionIds: null (all accounts allowed) by default;
+      // toggling the picker swaps it to an explicit list (which is the scoped mode).
+      setNewKeyAllowedConnectionIds(null);
+    }
+  }, [showAddModal, fetchAvailableConnections]);
 
   const handleDeleteKey = async (id) => {
     setConfirmState({
@@ -779,6 +824,57 @@ export default function APIPageClient({ machineId }) {
   const maskKey = (fullKey) => {
     if (!fullKey) return "";
     return fullKey.length > 8 ? fullKey.slice(0, 8) + "..." : fullKey;
+  };
+
+  // Format an expiry timestamp into a human-friendly absolute + relative string,
+  // plus a Tailwind text-color class indicating urgency.
+  // Returns { absolute, relative, color, isoUtc, isExpired } or null when no expiry.
+  const formatExpiry = (raw) => {
+    if (!raw) return null;
+    const ms = new Date(raw).getTime();
+    if (Number.isNaN(ms)) return null;
+    const now = Date.now();
+    const diff = ms - now;
+    const day = 86_400_000;
+    const isExpired = diff < 0;
+
+    let absolute;
+    try {
+      absolute = new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(new Date(ms));
+    } catch {
+      absolute = new Date(ms).toLocaleString();
+    }
+
+    let relative;
+    try {
+      const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+      const absDiff = Math.abs(diff);
+      if (absDiff < day) {
+        const hours = Math.round(diff / 3_600_000);
+        relative = rtf.format(hours, "hour");
+      } else {
+        const days = Math.round(diff / day);
+        relative = rtf.format(days, "day");
+      }
+    } catch {
+      relative = isExpired ? "expired" : "soon";
+    }
+
+    let color;
+    if (isExpired) color = "text-red-500";
+    else if (diff <= 7 * day) color = "text-yellow-600 dark:text-yellow-500";
+    else color = "text-green-600 dark:text-green-500";
+
+    return {
+      absolute,
+      relative,
+      color,
+      isoUtc: new Date(ms).toISOString(),
+      isExpired,
+    };
   };
 
   const toggleKeyVisibility = (keyId) => {
@@ -1172,13 +1268,16 @@ export default function APIPageClient({ machineId }) {
             {keys.map((key) => {
               const tier = key.tier || "unlimited";
               const isUnlimited = tier === "unlimited";
-              const isExpired = key.expiresAt && new Date(key.expiresAt).getTime() < Date.now();
+              const expiryMs = key.expiresAt ? new Date(key.expiresAt).getTime() : null;
+              const isExpired = expiryMs != null && expiryMs < Date.now();
+              const expiryInfo = formatExpiry(key.expiresAt);
               const tokenUsed = Number(key.tokenUsed || 0);
               const tokenLimit = key.tokenLimit != null ? Number(key.tokenLimit) : null;
               const usagePct = tokenLimit && tokenLimit > 0
                 ? Math.min(100, Math.round((tokenUsed / tokenLimit) * 100))
                 : null;
               const allowedCount = Array.isArray(key.allowedModels) ? key.allowedModels.length : 0;
+              const accountCount = Array.isArray(key.allowedConnectionIds) ? key.allowedConnectionIds.length : 0;
               return (
               <div
                 key={key.id}
@@ -1224,13 +1323,21 @@ export default function APIPageClient({ machineId }) {
                   </div>
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-text-muted">
                     <span>Created {new Date(key.createdAt).toLocaleDateString()}</span>
-                    {!isUnlimited && key.expiresAt && (
-                      <span className={isExpired ? "text-red-500" : ""}>
-                        Expires {new Date(key.expiresAt).toLocaleDateString()}
+                    {!isUnlimited && expiryInfo && (
+                      <span className={expiryInfo.color} title={expiryInfo.isoUtc}>
+                        {expiryInfo.isExpired ? "Expired " : "Expires "}
+                        {expiryInfo.absolute} ({expiryInfo.relative})
                       </span>
                     )}
                     {!isUnlimited && allowedCount > 0 && (
                       <span>{allowedCount} model{allowedCount === 1 ? "" : "s"} allowed</span>
+                    )}
+                    {!isUnlimited && Array.isArray(key.allowedConnectionIds) && (
+                      <span>
+                        {accountCount === 0
+                          ? "no accounts allowed"
+                          : `${accountCount} account${accountCount === 1 ? "" : "s"} allowed`}
+                      </span>
                     )}
                   </div>
                   {!isUnlimited && tokenLimit != null && tokenLimit > 0 && (
@@ -1296,6 +1403,7 @@ export default function APIPageClient({ machineId }) {
       <Modal
         isOpen={showAddModal}
         title="Create API Key"
+        size="full"
         onClose={() => {
           setShowAddModal(false);
           setNewKeyName("");
@@ -1303,111 +1411,10 @@ export default function APIPageClient({ machineId }) {
           setNewKeyExpiresAt("");
           setNewKeyTokenLimit("");
           setNewKeyAllowedModels([]);
+          setNewKeyAllowedConnectionIds(null);
         }}
-      >
-        <div className="flex flex-col gap-4">
-          <Input
-            label="Key Name"
-            value={newKeyName}
-            onChange={(e) => setNewKeyName(e.target.value)}
-            placeholder="Production Key"
-          />
-
-          <div>
-            <label className="block text-sm font-medium mb-2">Tier</label>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => setNewKeyTier("restricted")}
-                className={`px-3 py-2 rounded-lg border text-sm transition ${
-                  newKeyTier === "restricted"
-                    ? "border-primary bg-primary/10 text-primary font-medium"
-                    : "border-border text-text-muted hover:border-primary/50"
-                }`}
-              >
-                Restricted
-                <span className="block text-xs mt-0.5 opacity-70">Expiry · Quota · Allowlist</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setNewKeyTier("unlimited")}
-                className={`px-3 py-2 rounded-lg border text-sm transition ${
-                  newKeyTier === "unlimited"
-                    ? "border-primary bg-primary/10 text-primary font-medium"
-                    : "border-border text-text-muted hover:border-primary/50"
-                }`}
-              >
-                Unlimited
-                <span className="block text-xs mt-0.5 opacity-70">God mode · No limits</span>
-              </button>
-            </div>
-          </div>
-
-          {newKeyTier === "restricted" && (
-            <>
-              <Input
-                label="Expires At (optional)"
-                type="datetime-local"
-                value={newKeyExpiresAt}
-                onChange={(e) => setNewKeyExpiresAt(e.target.value)}
-              />
-              <Input
-                label="Token Limit (optional)"
-                type="number"
-                min="0"
-                value={newKeyTokenLimit}
-                onChange={(e) => setNewKeyTokenLimit(e.target.value)}
-                placeholder="e.g. 100000 (leave empty for unlimited tokens)"
-              />
-
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  Allowed Models{" "}
-                  <span className="text-text-muted font-normal">
-                    ({newKeyAllowedModels.length} selected, empty = all allowed)
-                  </span>
-                </label>
-                <div className="border border-border rounded-lg max-h-48 overflow-y-auto bg-surface-2">
-                  {availableModels.length === 0 ? (
-                    <div className="p-3 text-sm text-text-muted text-center">
-                      Loading models...
-                    </div>
-                  ) : (
-                    availableModels.map((modelId) => {
-                      const checked = newKeyAllowedModels.includes(modelId);
-                      return (
-                        <label
-                          key={modelId}
-                          className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-sm"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setNewKeyAllowedModels([...newKeyAllowedModels, modelId]);
-                              } else {
-                                setNewKeyAllowedModels(
-                                  newKeyAllowedModels.filter((m) => m !== modelId)
-                                );
-                              }
-                            }}
-                            className="rounded"
-                          />
-                          <code className="font-mono text-xs">{modelId}</code>
-                        </label>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            </>
-          )}
-
-          <div className="flex gap-2">
-            <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
-              Create
-            </Button>
+        footer={(
+          <div className="flex flex-col sm:flex-row sm:justify-end gap-2 w-full">
             <Button
               onClick={() => {
                 setShowAddModal(false);
@@ -1416,12 +1423,284 @@ export default function APIPageClient({ machineId }) {
                 setNewKeyExpiresAt("");
                 setNewKeyTokenLimit("");
                 setNewKeyAllowedModels([]);
+                setNewKeyAllowedConnectionIds(null);
               }}
               variant="ghost"
-              fullWidth
             >
               Cancel
             </Button>
+            <Button onClick={handleCreateKey} disabled={!newKeyName.trim()} icon="key">
+              Create API Key
+            </Button>
+          </div>
+        )}
+      >
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* LEFT COLUMN: identity + limits */}
+          <div className="flex flex-col gap-5">
+            <div>
+              <h3 className="text-sm font-semibold text-text-main mb-1">Basic Info</h3>
+              <p className="text-xs text-text-muted mb-3">
+                Give this key a recognisable name and pick a tier.
+              </p>
+              <Input
+                label="Key Name"
+                value={newKeyName}
+                onChange={(e) => setNewKeyName(e.target.value)}
+                placeholder="e.g. Production Key"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Tier</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setNewKeyTier("restricted")}
+                  className={`text-left px-3 py-3 rounded-lg border text-sm transition ${
+                    newKeyTier === "restricted"
+                      ? "border-primary bg-primary/10 text-primary font-medium"
+                      : "border-border text-text-muted hover:border-primary/50"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="material-symbols-outlined text-base">shield</span>
+                    Restricted
+                  </span>
+                  <span className="block text-xs mt-1 opacity-70">Expiry · Quota · Allowlist</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNewKeyTier("unlimited")}
+                  className={`text-left px-3 py-3 rounded-lg border text-sm transition ${
+                    newKeyTier === "unlimited"
+                      ? "border-primary bg-primary/10 text-primary font-medium"
+                      : "border-border text-text-muted hover:border-primary/50"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span className="material-symbols-outlined text-base">all_inclusive</span>
+                    Unlimited
+                  </span>
+                  <span className="block text-xs mt-1 opacity-70">Full access · No limits</span>
+                </button>
+              </div>
+            </div>
+
+            {newKeyTier === "restricted" && (
+              <div>
+                <h3 className="text-sm font-semibold text-text-main mb-1">Limits</h3>
+                <p className="text-xs text-text-muted mb-3">
+                  Optional. Leave blank for no expiry or token cap.
+                </p>
+                <div className="flex flex-col gap-3">
+                  <Input
+                    label="Expires At"
+                    type="datetime-local"
+                    value={newKeyExpiresAt}
+                    onChange={(e) => setNewKeyExpiresAt(e.target.value)}
+                  />
+                  <Input
+                    label="Token Limit"
+                    type="number"
+                    min="0"
+                    value={newKeyTokenLimit}
+                    onChange={(e) => setNewKeyTokenLimit(e.target.value)}
+                    placeholder="e.g. 100000"
+                  />
+                </div>
+              </div>
+            )}
+
+            {newKeyTier === "unlimited" && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400 flex gap-2">
+                <span className="material-symbols-outlined text-base shrink-0">warning</span>
+                <span>
+                  Unlimited keys bypass account scope, model allowlist, expiry,
+                  and token quota. Use only for trusted internal callers.
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* RIGHT COLUMN: scope */}
+          <div className="flex flex-col gap-5">
+            {newKeyTier === "restricted" ? (
+              <>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <h3 className="text-sm font-semibold text-text-main">Allowed Accounts</h3>
+                    <span className="text-xs text-text-muted">
+                      {newKeyAllowedConnectionIds === null
+                        ? "all accounts"
+                        : `${newKeyAllowedConnectionIds.length} selected`}
+                    </span>
+                  </div>
+                  <p className="text-xs text-text-muted mb-3">
+                    Restrict which provider accounts this key can use.
+                  </p>
+                  <div className="border border-border rounded-lg bg-surface-2 overflow-hidden">
+                    <label className="flex items-center gap-2 px-3 py-2.5 cursor-pointer text-sm border-b border-border bg-black/5 dark:bg-white/5">
+                      <input
+                        type="checkbox"
+                        checked={newKeyAllowedConnectionIds === null}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setNewKeyAllowedConnectionIds(null);
+                          } else {
+                            const noAuthTokens = noAuthProviders.map((p) => `noauth:${p.id}`);
+                            setNewKeyAllowedConnectionIds(noAuthTokens);
+                          }
+                        }}
+                        className="rounded"
+                      />
+                      <span className="font-medium">Allow all accounts (no scope)</span>
+                    </label>
+                    {newKeyAllowedConnectionIds !== null && (
+                      <div className="max-h-72 overflow-y-auto">
+                        {(() => {
+                          const grouped = new Map();
+                          for (const c of availableConnections) {
+                            if (!grouped.has(c.provider)) grouped.set(c.provider, []);
+                            grouped.get(c.provider).push(c);
+                          }
+                          const entries = Array.from(grouped.entries());
+                          if (entries.length === 0 && noAuthProviders.length === 0) {
+                            return (
+                              <div className="p-3 text-xs text-text-muted text-center">
+                                Loading accounts...
+                              </div>
+                            );
+                          }
+                          return entries.map(([providerId, conns]) => (
+                            <div key={providerId} className="border-b border-border last:border-b-0">
+                              <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted bg-black/5 dark:bg-white/5">
+                                {providerId}
+                              </div>
+                              {conns.map((c) => {
+                                const checked = newKeyAllowedConnectionIds.includes(c.id);
+                                const label = c.name || c.email || c.id.slice(0, 8);
+                                return (
+                                  <label
+                                    key={c.id}
+                                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-sm"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={(e) => {
+                                        const cur = newKeyAllowedConnectionIds || [];
+                                        if (e.target.checked) {
+                                          setNewKeyAllowedConnectionIds([...cur, c.id]);
+                                        } else {
+                                          setNewKeyAllowedConnectionIds(cur.filter((x) => x !== c.id));
+                                        }
+                                      }}
+                                      className="rounded"
+                                    />
+                                    <span className="font-mono text-xs">{providerId}/{label}</span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          ));
+                        })()}
+                        {noAuthProviders.length > 0 && (
+                          <div>
+                            <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted bg-black/5 dark:bg-white/5">
+                              No-Account Providers
+                            </div>
+                            {noAuthProviders.map((p) => {
+                              const token = `noauth:${p.id}`;
+                              const checked = newKeyAllowedConnectionIds.includes(token);
+                              return (
+                                <label
+                                  key={token}
+                                  className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-sm"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(e) => {
+                                      const cur = newKeyAllowedConnectionIds || [];
+                                      if (e.target.checked) {
+                                        setNewKeyAllowedConnectionIds([...cur, token]);
+                                      } else {
+                                        setNewKeyAllowedConnectionIds(cur.filter((x) => x !== token));
+                                      }
+                                    }}
+                                    className="rounded"
+                                  />
+                                  <span className="font-mono text-xs">
+                                    {p.name} <span className="text-text-muted">(no account)</span>
+                                  </span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <h3 className="text-sm font-semibold text-text-main">Allowed Models</h3>
+                    <span className="text-xs text-text-muted">
+                      {newKeyAllowedModels.length === 0
+                        ? "all models"
+                        : `${newKeyAllowedModels.length} selected`}
+                    </span>
+                  </div>
+                  <p className="text-xs text-text-muted mb-3">
+                    Empty list = all models allowed.
+                  </p>
+                  <div className="border border-border rounded-lg max-h-72 overflow-y-auto bg-surface-2">
+                    {availableModels.length === 0 ? (
+                      <div className="p-3 text-sm text-text-muted text-center">
+                        Loading models...
+                      </div>
+                    ) : (
+                      availableModels.map((modelId) => {
+                        const checked = newKeyAllowedModels.includes(modelId);
+                        return (
+                          <label
+                            key={modelId}
+                            className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer text-sm"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setNewKeyAllowedModels([...newKeyAllowedModels, modelId]);
+                                } else {
+                                  setNewKeyAllowedModels(
+                                    newKeyAllowedModels.filter((m) => m !== modelId)
+                                  );
+                                }
+                              }}
+                              className="rounded"
+                            />
+                            <code className="font-mono text-xs">{modelId}</code>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="rounded-lg border border-border bg-surface-2 p-6 text-center text-sm text-text-muted">
+                <span className="material-symbols-outlined text-3xl text-primary mb-2 block">
+                  vpn_key
+                </span>
+                Unlimited keys skip account and model scope.
+                <br />
+                Switch to <span className="font-medium text-text-main">Restricted</span> to set scopes.
+              </div>
+            )}
           </div>
         </div>
       </Modal>
@@ -1476,7 +1755,7 @@ export default function APIPageClient({ machineId }) {
                   Cloudflare Tunnel
                 </p>
                 <p className="text-sm text-text-muted">
-                  Expose your local 9Router to the internet. No port forwarding, no static IP needed. Share endpoint URL with your team or use it in Cursor, Cline, and other AI tools from anywhere.
+                  Expose your local {getBrandName()} to the internet. No port forwarding, no static IP needed. Share endpoint URL with your team or use it in Cursor, Cline, and other AI tools from anywhere.
                 </p>
               </div>
             </div>
